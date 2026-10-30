@@ -357,27 +357,47 @@ async def on_group_msg(gid, msg):
                        fwd.date or msg.date, "guruh", time.time())
 
 
+post_seen = OrderedDict()  # (kanal, post) -> post birinchi ko'rilgan vaqt
+
+
+def _retry_gap(elapsed):
+    # boshida juda tez, keyin siyrakroq (FloodWait bo'lmasligi uchun)
+    return 0.03 if elapsed < 0.6 else 0.1 if elapsed < 4 else 0.3
+
+
 async def on_channel_msg(ch_id, msg):
     t0 = time.perf_counter()
     recv_wall = time.time()
     post_id = msg.id
+    post_seen[(ch_id, post_id)] = recv_wall
+    if len(post_seen) > 2000:
+        post_seen.popitem(last=False)
     peer = await get_peer(ch_id)
     disc = None
-    for _ in range(25):
+    while True:
         if (ch_id, post_id) in done:
-            return
+            return  # guruh yo'li ulgurdi
+        el = time.perf_counter() - t0
+        if el > 20:
+            break
         try:
             disc = await client(GetDiscussionMessageRequest(peer=peer, msg_id=post_id))
-            break
+            if disc.messages:
+                break
         except MsgIdInvalidError:
-            await asyncio.sleep(0.015)
+            pass
         except FloodWaitError as e:
-            return fail(ch_id, post_id, f"FloodWait: {e.seconds} s", msg.date)
+            if (ch_id, post_id) not in done:
+                log("warn", f"Kanal yo'li FloodWait {e.seconds} s — guruh yo'li kutilmoqda", ch_name(ch_id))
+            return
         except Exception as e:
-            return fail(ch_id, post_id, f"{type(e).__name__}: {e}"[:200], msg.date)
+            if _lru_add(done, (ch_id, post_id)):
+                fail(ch_id, post_id, f"{type(e).__name__}: {e}"[:200], msg.date)
+            return
+        await asyncio.sleep(_retry_gap(el))
     if not disc or not disc.messages:
         if _lru_add(done, (ch_id, post_id)):
-            fail(ch_id, post_id, "Muhokama posti topilmadi (izohlar yopiq bo'lishi mumkin)", msg.date)
+            fail(ch_id, post_id, "20 s ichida muhokama posti paydo bo'lmadi (izohlar yopiq bo'lishi mumkin)", msg.date)
         return
     m = disc.messages[0]
     gid = utils.get_peer_id(m.peer_id)
@@ -390,11 +410,11 @@ async def on_channel_msg(ch_id, msg):
 
 
 async def dispatch(msg):
-    if not S["active"] or not isinstance(msg, types.Message) or msg.out:
+    if not S["active"] or not isinstance(msg, types.Message):
         return
     pid = utils.get_peer_id(msg.peer_id)
     if pid in group_to_channel:
-        if _lru_add(seen, (pid, msg.id)):
+        if not msg.out and _lru_add(seen, (pid, msg.id)):
             await on_group_msg(pid, msg)
     elif pid in texts:
         if _lru_add(seen, (pid, msg.id)):
@@ -484,6 +504,8 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
         cid, cdate = _sent_info(result, rid)
         diff = round((cdate - post_date).total_seconds(), 2) if cdate and post_date else None
         recv = round(tm["recv_wall"] - post_date.timestamp(), 2) if post_date else None
+        ps = post_seen.get((ch_id, post_id))
+        seen_s = round(ps - post_date.timestamp(), 2) if ps and post_date else None
         bump_stats(ch_id, True, tm["total"])
         c = S["channels"].get(ch_id) or {}
         link = post_link(ch_id, post_id, cid)
@@ -492,7 +514,7 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
                   wait=tm["wait"], send=tm["send"], recv=recv, diff=diff, src=tm["src"], last_err=None)
         entry = log("ok", f"Izoh yozildi — {tm['total']:.0f} ms", ch_name(ch_id),
                     ms=tm["total"], wait=tm["wait"], send=tm["send"], recv=recv, diff=diff,
-                    src=tm["src"], post=post_id, comment=cid, link=link,
+                    src=tm["src"], seen=seen_s, post=post_id, comment=cid, link=link,
                     post_time=fmt_t(post_date), comment_time=fmt_t(cdate))
         src_name = "izoh guruhi" if tm["src"] == "guruh" else "kanal posti"
         base = (
@@ -543,6 +565,7 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
 
 # ================= POLLER =================
 pollers = {}
+_poll_err = {}
 
 
 async def poll_peer(pid):
@@ -572,8 +595,12 @@ async def poll_peer(pid):
             await asyncio.sleep(e.seconds + 1)
         except asyncio.CancelledError:
             raise
-        except Exception:
+        except Exception as e:
             pts = None
+            now = time.time()
+            if now - _poll_err.get(pid, 0) > 60:
+                _poll_err[pid] = now
+                log("warn", f"Poll xatosi: {type(e).__name__}: {e}"[:200], ch_name(group_to_channel.get(pid, pid)))
             await asyncio.sleep(3)
 
 
@@ -635,8 +662,15 @@ async def resolve_link(s):
         if isinstance(info, types.ChatInviteAlready):
             return info.chat, None
         try:
-            upd = await client(ImportChatInviteRequest(v))
-            chat = next((c for c in upd.chats if isinstance(c, types.Channel)), upd.chats[0])
+            res = await client(ImportChatInviteRequest(v))
+            chats = (getattr(res, "chats", None)
+                     or getattr(getattr(res, "updates", None), "chats", None) or [])
+            chat = next((c for c in chats if isinstance(c, types.Channel)), None)
+            if chat is None:  # har qanday Telethon versiyasi uchun
+                info = await client(CheckChatInviteRequest(v))
+                chat = getattr(info, "chat", None)
+            if chat is None:
+                raise ValueError("Qo'shildi, lekin kanal ma'lumoti olinmadi — qayta urinib ko'ring")
             return chat, "Havola orqali qo'shildi"
         except UserAlreadyParticipantError:
             info = await client(CheckChatInviteRequest(v))

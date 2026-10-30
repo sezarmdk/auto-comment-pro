@@ -391,7 +391,7 @@ function evRow(e, full){
     const add=(a,b)=>{ if(b!==undefined && b!==null && b!=="") pairs.push(`<span>${a}</span><span>${E(b)}</span>`); };
     add("Vaqt", new Date(e.ts*1000).toLocaleString("uz-UZ",{hour12:false}));
     add("Jami", d.ms!=null? d.ms+" ms":null); add("Kutish", d.wait!=null? d.wait+" ms":null); add("So'rov", d.send!=null? d.send+" ms":null);
-    add("Kelishi", d.recv!=null? d.recv+" s":null); add("Server farqi", d.diff!=null? d.diff+" s":null);
+    add("Post ko'rildi", d.seen!=null? d.seen+" s":null); add("Kelishi", d.recv!=null? d.recv+" s":null); add("Server farqi", d.diff!=null? d.diff+" s":null);
     add("Yo'l", d.src? (d.src==="guruh"?"izoh guruhi":"kanal posti"):null);
     add("Post vaqti", d.post_time); add("Izoh vaqti", d.comment_time); add("Post ID", d.post); add("Izoh ID", d.comment);
     add("Yangi matn", d.new_text); add("Kutildi", d.delay!=null? d.delay+" s":null);
