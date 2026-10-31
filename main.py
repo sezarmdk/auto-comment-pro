@@ -600,6 +600,8 @@ async def poll_peer(pid):
     while True:
         try:
             iv = S["poll"]
+            if iv > 0 and pid not in group_to_channel:
+                iv = max(iv, 1.0)  # kanal: sekinroq, guruh: eng tez
             _t = time.perf_counter()
             if iv <= 0 or not (pid in group_to_channel or pid in S["channels"]):
                 return
@@ -638,7 +640,7 @@ def ensure_pollers():
             t.cancel()
         pollers.clear()
         return
-    want = set(S["channels"])
+    want = set(group_to_channel) | set(S["channels"])
     for pid in list(pollers):
         if pid not in want:
             pollers.pop(pid).cancel()
