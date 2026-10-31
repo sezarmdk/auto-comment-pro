@@ -375,7 +375,7 @@ def _keep(d, k, v):
 
 def _retry_gap(elapsed):
     # boshida juda tez, keyin siyrakroq (FloodWait bo'lmasligi uchun)
-    return 0.03 if elapsed < 0.6 else 0.1 if elapsed < 4 else 0.3
+    return 0.25 if elapsed < 6 else 0.5
 
 
 async def on_channel_msg(ch_id, msg):
@@ -385,6 +385,7 @@ async def on_channel_msg(ch_id, msg):
     post_seen[(ch_id, post_id)] = recv_wall
     if len(post_seen) > 2000:
         post_seen.popitem(last=False)
+    start_burst(ch_id, post_id, msg.date)
     peer = await get_peer(ch_id)
     disc = None
     info = [0, None]
@@ -404,9 +405,10 @@ async def on_channel_msg(ch_id, msg):
         except MsgIdInvalidError:
             pass
         except FloodWaitError as e:
-            if (ch_id, post_id) not in done:
-                log("warn", f"Kanal yo'li FloodWait {e.seconds} s — guruh yo'li kutilmoqda", ch_name(ch_id))
-            return
+            if e.seconds > 4:
+                return  # guruh yo'li (burst poll) davom etadi
+            await asyncio.sleep(e.seconds + 0.05)
+            continue
         except Exception as e:
             if _lru_add(done, (ch_id, post_id)):
                 fail(ch_id, post_id, f"{type(e).__name__}: {e}"[:200], msg.date)
@@ -593,6 +595,65 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
 # ================= POLLER =================
 pollers = {}
 _poll_err = {}
+pts_state = {}       # guruh/kanal -> oxirgi pts (poll va burst baham ko'radi)
+BURST_GAP = 0.12     # burst poll oralig'i (s)
+burst_posts = {}     # guruh -> [(kanal, post, tugash vaqti)]
+burst_tasks = {}
+
+
+async def _diff(pid, peer):
+    pts = pts_state.get(pid)
+    if pts is None:
+        pts = (await client(GetFullChannelRequest(peer))).full_chat.pts
+    res = await client(GetChannelDifferenceRequest(
+        channel=peer, filter=types.ChannelMessagesFilterEmpty(),
+        pts=pts, limit=100, force=True))
+    if isinstance(res, types.updates.ChannelDifference):
+        pts_state[pid] = res.pts
+        for m in res.new_messages:
+            asyncio.create_task(dispatch(m))
+    elif isinstance(res, types.updates.ChannelDifferenceEmpty):
+        pts_state[pid] = res.pts
+    else:
+        pts_state.pop(pid, None)
+
+
+async def burst_loop(gid):
+    """Post ko'rilgach, izoh guruhini juda tez (~0.12 s) tekshiradi — nusxa paydo bo'lishi bilan ushlash uchun."""
+    try:
+        peer = await get_peer(gid)
+        while True:
+            now = time.time()
+            live = [x for x in burst_posts.get(gid, []) if x[2] > now and (x[0], x[1]) not in done]
+            burst_posts[gid] = live
+            if not live:
+                return
+            if now < min(x[3] for x in live):
+                await asyncio.sleep(min(x[3] for x in live) - now)
+                continue
+            t = time.perf_counter()
+            await _diff(gid, peer)
+            await asyncio.sleep(max(0.0, BURST_GAP - (time.perf_counter() - t)))
+    except FloodWaitError as e:
+        log("warn", f"Burst poll FloodWait {e.seconds} s", str(gid))
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pts_state.pop(gid, None)
+
+
+def start_burst(ch_id, post_id, post_date):
+    if S["poll"] <= 0:
+        return
+    gid = next((g for g, c in group_to_channel.items() if c == ch_id), None)
+    if gid is None:
+        return
+    tp = post_date.timestamp() if post_date else time.time()
+    # nusxa postdan ~3 s keyin chiqadi: 1.5 s dan boshlab 12 s gacha tez tekshiramiz
+    burst_posts.setdefault(gid, []).append((ch_id, post_id, tp + 12, tp + 1.5))
+    t = burst_tasks.get(gid)
+    if t is None or t.done():
+        burst_tasks[gid] = asyncio.create_task(burst_loop(gid))
 
 
 async def poll_peer(pid):
@@ -606,19 +667,7 @@ async def poll_peer(pid):
             if iv <= 0 or not (pid in group_to_channel or pid in S["channels"]):
                 return
             peer = await get_peer(pid)
-            if pts is None:
-                pts = (await client(GetFullChannelRequest(peer))).full_chat.pts
-            res = await client(GetChannelDifferenceRequest(
-                channel=peer, filter=types.ChannelMessagesFilterEmpty(),
-                pts=pts, limit=100, force=True))
-            if isinstance(res, types.updates.ChannelDifference):
-                pts = res.pts
-                for m in res.new_messages:
-                    asyncio.create_task(dispatch(m))
-            elif isinstance(res, types.updates.ChannelDifferenceEmpty):
-                pts = res.pts
-            else:
-                pts = None
+            await _diff(pid, peer)
             await asyncio.sleep(max(0.0, iv - (time.perf_counter() - _t)))
         except FloodWaitError as e:
             log("warn", f"Poll FloodWait {e.seconds} s — poll sekinlashtiring", str(pid))
@@ -626,7 +675,7 @@ async def poll_peer(pid):
         except asyncio.CancelledError:
             raise
         except Exception as e:
-            pts = None
+            pts_state.pop(pid, None)
             now = time.time()
             if now - _poll_err.get(pid, 0) > 60:
                 _poll_err[pid] = now
