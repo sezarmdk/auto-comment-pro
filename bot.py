@@ -252,6 +252,7 @@ client = TelegramClient(
     StringSession(STRING_SESSION), API_ID, API_HASH,
     connection=ConnectionTcpAbridged, connection_retries=None,
     retry_delay=1, auto_reconnect=True, request_retries=2,
+    flood_sleep_threshold=0,
 )
 
 group_to_channel = {}   # guruh_id -> kanal_id
@@ -525,6 +526,7 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
             f"⚡ Yuborish: <code>{tm['total']:.1f} ms</code>"
             f" (kutish {tm['wait']:.0f} + so'rov {tm['send']:.0f})\n"
             f"📥 Kelishi: <code>{recv if recv is not None else '—'} s</code> · {src_name}\n"
+            f"👁 Kanalda ko'rildi: <code>{seen_s if seen_s is not None else '—'} s</code>\n"
             f"⏱ Server farqi: <code>{diff if diff is not None else '—'} s</code>\n"
             f"🔗 <a href=\"{link}\">Izohni ochish</a>"
         )
@@ -573,6 +575,7 @@ async def poll_peer(pid):
     while True:
         try:
             iv = S["poll"]
+            _t = time.perf_counter()
             if iv <= 0 or not (pid in group_to_channel or pid in S["channels"]):
                 return
             peer = await get_peer(pid)
@@ -589,7 +592,7 @@ async def poll_peer(pid):
                 pts = res.pts
             else:
                 pts = None
-            await asyncio.sleep(iv)
+            await asyncio.sleep(max(0.0, iv - (time.perf_counter() - _t)))
         except FloodWaitError as e:
             log("warn", f"Poll FloodWait {e.seconds} s — poll sekinlashtiring", str(pid))
             await asyncio.sleep(e.seconds + 1)
@@ -610,7 +613,7 @@ def ensure_pollers():
             t.cancel()
         pollers.clear()
         return
-    want = set(group_to_channel) | set(S["channels"])
+    want = set(S["channels"])
     for pid in list(pollers):
         if pid not in want:
             pollers.pop(pid).cancel()
