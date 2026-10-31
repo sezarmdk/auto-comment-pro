@@ -354,11 +354,23 @@ async def on_group_msg(gid, msg):
     if not post_id or (ch_id, post_id) in done:
         return
     t0 = time.perf_counter()
+    try:
+        _keep(copy_info, (ch_id, post_id), int((msg.date - (fwd.date or msg.date)).total_seconds()))
+    except Exception:
+        pass
     await send_comment(ch_id, await get_peer(gid), msg.id, post_id, t0,
                        fwd.date or msg.date, "guruh", time.time())
 
 
 post_seen = OrderedDict()  # (kanal, post) -> post birinchi ko'rilgan vaqt
+disc_info = OrderedDict()  # (kanal, post) -> [so'rovlar soni, nusxa topilgan vaqt]
+copy_info = OrderedDict()  # (kanal, post) -> guruhdagi nusxa sanasi - post sanasi (s)
+
+
+def _keep(d, k, v):
+    d[k] = v
+    if len(d) > 2000:
+        d.popitem(last=False)
 
 
 def _retry_gap(elapsed):
@@ -375,6 +387,8 @@ async def on_channel_msg(ch_id, msg):
         post_seen.popitem(last=False)
     peer = await get_peer(ch_id)
     disc = None
+    info = [0, None]
+    _keep(disc_info, (ch_id, post_id), info)
     while True:
         if (ch_id, post_id) in done:
             return  # guruh yo'li ulgurdi
@@ -382,8 +396,10 @@ async def on_channel_msg(ch_id, msg):
         if el > 20:
             break
         try:
+            info[0] += 1
             disc = await client(GetDiscussionMessageRequest(peer=peer, msg_id=post_id))
             if disc.messages:
+                info[1] = time.time()
                 break
         except MsgIdInvalidError:
             pass
@@ -518,6 +534,14 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
                     src=tm["src"], seen=seen_s, post=post_id, comment=cid, link=link,
                     post_time=fmt_t(post_date), comment_time=fmt_t(cdate))
         src_name = "izoh guruhi" if tm["src"] == "guruh" else "kanal posti"
+        extra = ""
+        cl = copy_info.get((ch_id, post_id))
+        if cl is not None:
+            extra += f"🧬 Nusxa sanasi: <code>+{cl} s</code>\n"
+        di = disc_info.get((ch_id, post_id))
+        if di and post_date:
+            fnd = (f"{round(di[1] - post_date.timestamp(), 2)} s da topildi" if di[1] else "topilmadi")
+            extra += f"🔎 Kanal yo'li: <code>{di[0]} so'rov, {fnd}</code>\n"
         base = (
             "✅ <b>Izoh yozildi</b>\n\n"
             f"📢 <b>{html.escape(ch_name(ch_id))}</b>\n"
@@ -527,6 +551,7 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
             f" (kutish {tm['wait']:.0f} + so'rov {tm['send']:.0f})\n"
             f"📥 Kelishi: <code>{recv if recv is not None else '—'} s</code> · {src_name}\n"
             f"👁 Kanalda ko'rildi: <code>{seen_s if seen_s is not None else '—'} s</code>\n"
+            f"{extra}"
             f"⏱ Server farqi: <code>{diff if diff is not None else '—'} s</code>\n"
             f"🔗 <a href=\"{link}\">Izohni ochish</a>"
         )
