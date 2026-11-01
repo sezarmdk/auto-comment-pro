@@ -540,6 +540,10 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
         cl = copy_info.get((ch_id, post_id))
         if cl is not None:
             extra += f"🧬 Nusxa sanasi: <code>+{cl} s</code>\n"
+        gid_ = next((g for g, c in group_to_channel.items() if c == ch_id), None)
+        rs = burst_rtt.get(gid_)
+        if rs:
+            extra += f"🔁 Poll javobi: <code>o'rtacha {sum(rs) / len(rs):.0f} ms, eng sekin {max(rs):.0f} ms</code>\n"
         di = disc_info.get((ch_id, post_id))
         if di and post_date:
             fnd = (f"{round(di[1] - post_date.timestamp(), 2)} s da topildi" if di[1] else "topilmadi")
@@ -596,7 +600,9 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
 pollers = {}
 _poll_err = {}
 pts_state = {}       # guruh/kanal -> oxirgi pts (poll va burst baham ko'radi)
-BURST_GAP = 0.12     # burst poll oralig'i (s)
+BURST_GAP = 0.1      # burst poll oralig'i (s) — AGRESSIV rejim
+BURST_INFLIGHT = 4   # bir vaqtda ochiq turishi mumkin bo'lgan burst so'rovlar soni
+burst_rtt = {}       # guruh -> so'nggi burst so'rovlar davomiyligi (ms)
 burst_posts = {}     # guruh -> [(kanal, post, tugash vaqti)]
 burst_tasks = {}
 
@@ -620,6 +626,21 @@ async def _diff(pid, peer):
 
 async def burst_loop(gid):
     """Post ko'rilgach, izoh guruhini juda tez (~0.12 s) tekshiradi — nusxa paydo bo'lishi bilan ushlash uchun."""
+    flood = []
+    tasks = set()
+    gap = BURST_GAP
+
+    async def one(peer):
+        # so'rov oldingisi tugashini kutmaydi: server sekin javob bersa ham yangi ma'lumot tez keladi
+        t = time.perf_counter()
+        try:
+            await _diff(gid, peer)
+            burst_rtt.setdefault(gid, deque(maxlen=30)).append((time.perf_counter() - t) * 1000)
+        except FloodWaitError as e:
+            flood.append(e.seconds)
+        except Exception:
+            pts_state.pop(gid, None)
+
     try:
         peer = await get_peer(gid)
         while True:
@@ -631,11 +652,21 @@ async def burst_loop(gid):
             if now < min(x[3] for x in live):
                 await asyncio.sleep(min(x[3] for x in live) - now)
                 continue
-            t = time.perf_counter()
-            await _diff(gid, peer)
-            await asyncio.sleep(max(0.0, BURST_GAP - (time.perf_counter() - t)))
-    except FloodWaitError as e:
-        log("warn", f"Burst poll FloodWait {e.seconds} s", str(gid))
+            if flood:
+                secs = max(flood)
+                flood.clear()
+                if secs > 3:
+                    log("warn", f"Burst poll FloodWait {secs} s — to'xtatildi", str(gid))
+                    return
+                # qisqa FloodWait: kutib, oraliqni biroz sekinlashtirib davom etamiz
+                gap = min(0.4, gap * 1.5)
+                log("warn", f"Burst poll FloodWait {secs} s — oraliq {gap:.2f} s", str(gid))
+                await asyncio.sleep(secs + 0.05)
+                continue
+            tasks = {x for x in tasks if not x.done()}
+            if len(tasks) < BURST_INFLIGHT:
+                tasks.add(asyncio.create_task(one(peer)))
+            await asyncio.sleep(gap)
     except asyncio.CancelledError:
         raise
     except Exception:
@@ -935,7 +966,7 @@ async def op_settings(b):
         changed.append(f"hisobot {S['report']}")
     if "poll" in b:
         v = float(b["poll"])
-        S["poll"] = 0.0 if v <= 0 else round(max(0.3, min(5.0, v)), 2)
+        S["poll"] = 0.0 if v <= 0 else round(max(0.1, min(5.0, v)), 2)
         ensure_pollers()
         changed.append(f"poll {S['poll'] or 'o`chiq'}")
     if changed:
