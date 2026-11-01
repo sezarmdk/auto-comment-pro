@@ -260,6 +260,14 @@ input_peers = {}
 texts = {}              # FAOL kanal_id -> matn (oldindan tayyor)
 done = OrderedDict()
 seen = OrderedDict()
+_bg = set()  # fon tasklar havolasi (Python ularni GC qilib yubormasligi uchun)
+
+
+def spawn(coro):
+    t = asyncio.create_task(coro)
+    _bg.add(t)
+    t.add_done_callback(_bg.discard)
+    return t
 
 
 def _lru_add(od, key, limit=5000):
@@ -329,7 +337,7 @@ async def send_comment(ch_id, gpeer, reply_id, post_id, t0, post_date, src, recv
             reply_to=types.InputReplyToMessage(reply_to_msg_id=reply_id),
         ))
         te = time.perf_counter()
-        asyncio.create_task(after_send(ch_id, gpeer, result, rid, post_id, post_date, {
+        spawn(after_send(ch_id, gpeer, result, rid, post_id, post_date, {
             "total": round((te - t0) * 1000, 1), "wait": round((ts - t0) * 1000, 1),
             "send": round((te - ts) * 1000, 1), "src": src, "recv_wall": recv_wall}))
     except FloodWaitError as e:
@@ -497,7 +505,7 @@ def fail(ch_id, post_id, reason, post_date=None):
     link = post_link(ch_id, post_id)
     log("err", f"Izoh yozilmadi: {reason}", ch_name(ch_id), post=post_id, link=link,
         post_time=fmt_t(post_date))
-    asyncio.create_task(send_report(
+    spawn(send_report(
         "❌ <b>Izoh yozilmadi</b>\n\n"
         f"📢 <b>{html.escape(ch_name(ch_id))}</b>\n"
         f"🕒 Post: <code>{fmt_t(post_date)}</code>\n"
@@ -600,8 +608,8 @@ async def after_send(ch_id, gpeer, result, rid, post_id, post_date, tm):
 pollers = {}
 _poll_err = {}
 pts_state = {}       # guruh/kanal -> oxirgi pts (poll va burst baham ko'radi)
-BURST_GAP = 0.1      # burst poll oralig'i (s) — AGRESSIV rejim
-BURST_INFLIGHT = 4   # bir vaqtda ochiq turishi mumkin bo'lgan burst so'rovlar soni
+BURST_GAP = max(0.02, float(os.environ.get("BURST_GAP", "0.1")))      # burst poll oralig'i (s); env bilan o'zgartiriladi
+BURST_INFLIGHT = max(1, int(os.environ.get("BURST_INFLIGHT", "4")))   # bir vaqtda ochiq turishi mumkin bo'lgan burst so'rovlar soni
 burst_rtt = {}       # guruh -> so'nggi burst so'rovlar davomiyligi (ms)
 burst_posts = {}     # guruh -> [(kanal, post, tugash vaqti)]
 burst_tasks = {}
@@ -617,11 +625,28 @@ async def _diff(pid, peer):
     if isinstance(res, types.updates.ChannelDifference):
         pts_state[pid] = res.pts
         for m in res.new_messages:
-            asyncio.create_task(dispatch(m))
+            spawn(dispatch(m))
     elif isinstance(res, types.updates.ChannelDifferenceEmpty):
         pts_state[pid] = res.pts
     else:
         pts_state.pop(pid, None)
+        now = time.time()
+        for m in getattr(res, "messages", []) or []:
+            try:
+                if isinstance(m, types.Message) and now - m.date.timestamp() < 20:
+                    spawn(dispatch(m))   # faqat yangi xabarlar (eski postlarga yozib yubormaslik uchun)
+            except Exception:
+                pass
+
+
+async def loop_lag_monitor():
+    """Event loop to'xtab qolayotganini aniqlaydi (50 ms dan ortiq bo'lsa logga yozadi)."""
+    while True:
+        t = time.perf_counter()
+        await asyncio.sleep(0.05)
+        lag = (time.perf_counter() - t - 0.05) * 1000
+        if lag > 50:
+            log("warn", f"Event loop {lag:.0f} ms to'xtab qoldi")
 
 
 async def burst_loop(gid):
@@ -913,6 +938,9 @@ async def op_del_channel(pid):
     for gid, ch in list(group_to_channel.items()):
         if ch == pid:
             group_to_channel.pop(gid, None)
+            pts_state.pop(gid, None)
+            burst_posts.pop(gid, None)
+    pts_state.pop(pid, None)
     rebuild_texts()
     ensure_pollers()
     if c:
@@ -1271,8 +1299,9 @@ async def main():
     log("sys", f"Ishga tushdi: {me.first_name} · DC{client.session.dc_id} · {store.kind} · "
                f"{len(texts)} faol kanal")
     await save_now()
-    asyncio.create_task(saver_loop())
-    asyncio.create_task(bot_loop())
+    spawn(saver_loop())
+    spawn(bot_loop())
+    spawn(loop_lag_monitor())
     gc.collect()
     gc.freeze()
     print(">>> Komment Pilot v2 ishga tushdi!")
