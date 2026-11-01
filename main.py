@@ -196,7 +196,9 @@ class Store:
         global _dirty, PENDING
         if not _dirty and not PENDING:
             return
+        _t = time.perf_counter()
         state_json = json.dumps(dump_state(), ensure_ascii=False)
+        _mark("flush-json", _t)
         batch, PENDING = PENDING, []
         _dirty = False
         try:
@@ -260,6 +262,23 @@ input_peers = {}
 texts = {}              # FAOL kanal_id -> matn (oldindan tayyor)
 done = OrderedDict()
 seen = OrderedDict()
+_ev = deque(maxlen=300)  # diagnostika: (tugash vaqti, nom, davomiylik ms)
+_gc_t0 = [0.0]
+
+
+def _mark(name, t0):
+    now = time.perf_counter()
+    _ev.append((now, name, (now - t0) * 1000))
+
+
+def _gc_cb(phase, info):
+    if phase == "start":
+        _gc_t0[0] = time.perf_counter()
+    else:
+        _mark(f"gc{info.get('generation')}", _gc_t0[0])
+
+
+gc.callbacks.append(_gc_cb)
 _bg = set()  # fon tasklar havolasi (Python ularni GC qilib yubormasligi uchun)
 
 
@@ -640,13 +659,23 @@ async def _diff(pid, peer):
 
 
 async def loop_lag_monitor():
-    """Event loop to'xtab qolayotganini aniqlaydi (50 ms dan ortiq bo'lsa logga yozadi)."""
+    """Event loop to'xtab qolishini aniqlaydi va sababini taxmin qiladi."""
     while True:
         t = time.perf_counter()
+        c = time.process_time()
         await asyncio.sleep(0.05)
-        lag = (time.perf_counter() - t - 0.05) * 1000
+        t2 = time.perf_counter()
+        lag = (t2 - t - 0.05) * 1000
         if lag > 50:
-            log("warn", f"Event loop {lag:.0f} ms to'xtab qoldi")
+            cpu = (time.process_time() - c) * 1000
+            sus = [f"{n} {ms:.0f} ms" for (te, n, ms) in list(_ev)
+                   if ms >= 5 and t - 0.01 <= te <= t2 + 0.01]
+            if cpu >= lag * 0.6:
+                why = "kod band (CPU)"
+            else:
+                why = "protsess navbat kutdi (xosting CPU cheklovi)"
+            log("warn", f"Event loop {lag:.0f} ms to'xtadi · CPU {cpu:.0f} ms · {why}"
+                        + (f" · {', '.join(sus)}" if sus else ""))
 
 
 async def burst_loop(gid):
@@ -1089,6 +1118,7 @@ async def mw(request, handler):
     if request.path.startswith("/api/"):
         if not check_init_data(request.headers.get("X-Init-Data", "")):
             return web.json_response({"error": "Ruxsat yo'q"}, status=403)
+        _t = time.perf_counter()
         try:
             return await handler(request)
         except (ValueError, KeyError, TypeError) as e:
@@ -1098,6 +1128,8 @@ async def mw(request, handler):
         except Exception as e:
             log("err", f"API xato {request.path}: {e}")
             return web.json_response({"error": f"{type(e).__name__}: {e}"[:200]}, status=500)
+        finally:
+            _mark("web " + request.path, _t)
     return await handler(request)
 
 
